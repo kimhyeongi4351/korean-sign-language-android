@@ -4,8 +4,12 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.ImageFormat
 import android.graphics.Matrix
+import android.graphics.Rect
+import android.graphics.YuvImage
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Size
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
@@ -25,6 +29,7 @@ import kotlinx.coroutines.launch
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.support.common.FileUtil
 import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
 import java.io.InputStreamReader
 import java.util.concurrent.Executor
 
@@ -70,7 +75,7 @@ class MainActivity : AppCompatActivity() {
                             .build()
                     )
                     .setRunningMode(com.google.mediapipe.tasks.vision.core.RunningMode.LIVE_STREAM)
-                    .setResultListener { result ->
+                    .setResultListener { result, mpImage ->
                         handleHandLandmarkerResult(result)
                     }
 
@@ -128,14 +133,17 @@ class MainActivity : AppCompatActivity() {
     private fun processImage(imageProxy: ImageProxy) {
         try {
             val bitmap = imageProxyToBitmap(imageProxy)
-            
-            // Detect hand landmarks
+
             val mpImage = BitmapImageBuilder(bitmap).build()
-            
-            handLandmarker?.detectAsync(mpImage, imageProxy.imageInfo.rotationDegrees.toLong())
-            
-            imageProxy.close()
+
+            // 두 번째 인자는 회전 각도가 아니라 타임스탬프입니다.
+            handLandmarker?.detectAsync(
+                mpImage,
+                SystemClock.uptimeMillis()
+            )
         } catch (e: Exception) {
+            e.printStackTrace()
+        } finally {
             imageProxy.close()
         }
     }
@@ -171,14 +179,14 @@ class MainActivity : AppCompatActivity() {
             val maxIdx = predictions.indices.maxByOrNull { predictions[it] } ?: 0
             val confidence = predictions[maxIdx]
             
-            val result = if (confidence > 0.5f) {
+            val resultText = if (confidence > 0.5f) {
                 "${labels.getOrNull(maxIdx) ?: "Unknown"} (${String.format("%.2f", confidence * 100)}%)"
             } else {
                 "Confidence too low"
             }
 
             runOnUiThread {
-                resultTextView.text = result
+                resultTextView.text = resultText
             }
         } catch (e: Exception) {
             runOnUiThread {
@@ -207,29 +215,61 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap {
-        val planes = imageProxy.planes
-        val buffer = planes[0].buffer
-        val pixelStride = planes[0].pixelStride
-        val width = imageProxy.width
-        val height = imageProxy.height
-        val rowPadding = planes[0].rowPadding
+        val yBuffer = imageProxy.planes[0].buffer
+        val uBuffer = imageProxy.planes[1].buffer
+        val vBuffer = imageProxy.planes[2].buffer
 
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val data = ByteArray(buffer.remaining())
-        buffer.get(data)
+        val ySize = yBuffer.remaining()
+        val uSize = uBuffer.remaining()
+        val vSize = vBuffer.remaining()
 
-        // Convert NV21 to Bitmap (simplified)
-        val pixels = IntArray(width * height)
-        for (i in 0 until width * height) {
-            val y = data[i].toInt() and 0xFF
-            pixels[i] = android.graphics.Color.rgb(y, y, y)
-        }
-        bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
+        val nv21 = ByteArray(ySize + uSize + vSize)
 
-        // Rotate 90 degrees for front camera
+        // NV21은 Y + V + U 순서입니다.
+        yBuffer.get(nv21, 0, ySize)
+        vBuffer.get(nv21, ySize, vSize)
+        uBuffer.get(nv21, ySize + vSize, uSize)
+
+        val yuvImage = YuvImage(
+            nv21,
+            ImageFormat.NV21,
+            imageProxy.width,
+            imageProxy.height,
+            null
+        )
+
+        val outputStream = ByteArrayOutputStream()
+
+        yuvImage.compressToJpeg(
+            Rect(0, 0, imageProxy.width, imageProxy.height),
+            100,
+            outputStream
+        )
+
+        val jpegBytes = outputStream.toByteArray()
+        val bitmap = BitmapFactory.decodeByteArray(
+            jpegBytes,
+            0,
+            jpegBytes.size
+        )
+
         val matrix = Matrix()
-        matrix.postRotate(90f)
-        return Bitmap.createBitmap(bitmap, 0, 0, width, height, matrix, true)
+
+        // CameraX 이미지 회전 적용
+        matrix.postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
+
+        // 전면 카메라 좌우 반전
+        matrix.postScale(-1f, 1f)
+
+        return Bitmap.createBitmap(
+            bitmap,
+            0,
+            0,
+            bitmap.width,
+            bitmap.height,
+            matrix,
+            true
+        )
     }
 
     private fun allPermissionsGranted(): Boolean {
